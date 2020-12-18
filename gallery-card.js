@@ -4,7 +4,72 @@ import {
   css
 } from "https://unpkg.com/lit-element@2.0.1/lit-element.js?module";
 
+class GalleryCardDateFormatter{
+  
+  constructor() {
+    this.moment = undefined;
+    try {
+      import("https://unpkg.com/moment@2.24.0/src/moment.js?module").then((module) => {
+        this.moment = module.default;
+        console.log("Loaded Moment module.");
+      });
+    }
+    catch (e) {
+      console.log("Error Loading Moment module", e.message);
+      throw new Error("Error Loading Moment module" + e.message);
+    }
+  }
+
+  currentDate(format) {
+    var today = new Date();
+    if (this.moment) {
+      if (!format) {
+        format = "YYYYMMDD";
+      }
+      return this.moment(today).format(format);
+    } else {
+      var dd = ('0' + today.getDate()).slice(-2);
+      var mm = ('0' + (today.getMonth() + 1)).slice(-2);;
+      var yyyy = today.getFullYear();
+      return yyyy + "-" + mm + "-" + dd;
+    }
+  }
+
+  format(value, inputFormat, outputFormat) {
+    if (this.moment) {
+      try {
+        
+            var date = this.moment(value, inputFormat);
+            return this.moment(date).format(outputFormat);
+      
+      } catch (error) {
+        return value;
+      }
+    }
+    return value;
+  }
+
+}
+
 class GalleryCard extends LitElement {
+
+  constructor() {
+    super();
+
+    this.formatter = new GalleryCardDateFormatter();
+
+    this.resources = [];
+
+    //reload on button pressed
+    this.addEventListener('loadMedia', async (e) => {
+      this._loadResources();
+    });
+  }
+
+  firstUpdated(changedProperties) {
+    setTimeout(() => this._loadResources(), 1000)
+  }
+
   static get properties() {
     return {
       hass: {},
@@ -17,12 +82,24 @@ class GalleryCard extends LitElement {
     };
   }
 
+  loadMedia() {
+    let newMessage = new CustomEvent('loadMedia', { block: 1 });
+    this.dispatchEvent(newMessage);
+  }
+
   render() {
-    this._loadResources();
     const menuAlignment = (this.config.menu_alignment || "responsive").toLowerCase();
 
+    if (this.error) {
+      return html`
+        ${this.error}
+      `;
+    }
+
     return html`
+
         <ha-card .header=${this.config.title} class="menu-${menuAlignment}">
+          <button @click="${this.loadMedia}">Load data</button>
           <div class="resource-viewer" @touchstart="${ev => this._handleTouchStart(ev)}" @touchmove="${ev => this._handleTouchMove(ev)}">
             <figure>
               ${
@@ -189,6 +266,7 @@ class GalleryCard extends LitElement {
   };
 
   _loadResources() {
+
     this.resources = [];
 
     const maximumFiles = this.config.maximum_files;
@@ -196,14 +274,21 @@ class GalleryCard extends LitElement {
     const captionFormat = this.config.caption_format;
 
     this.config.entities.forEach(entityId => {
-      var entityState = this.hass.states[entityId];
+      //media_content_id
+      if (entityId.startsWith('media-source')) {
+        this._loadMediaResources(entityId, maximumFiles, fileNameFormat, captionFormat);
+      } else {
+        //entity
+        var entityState = this.hass.states[entityId];
 
-      if (entityState.attributes.entity_picture != undefined)
-        this._loadCameraResource(entityId, entityState);
+        if (entityState.attributes.entity_picture != undefined)
+          this._loadCameraResource(entityId, entityState);
 
-      if (entityState.attributes.fileList != undefined)
-        this._loadFilesResources(entityState.attributes.fileList, maximumFiles, fileNameFormat, captionFormat);
+        if (entityState.attributes.fileList != undefined)
+          this._loadFilesResources(entityState.attributes.fileList, maximumFiles, fileNameFormat, captionFormat);
+      }
     });
+
   }
 
   _loadCameraResource(entityId, camera) {
@@ -281,6 +366,84 @@ class GalleryCard extends LitElement {
       
         this.resources.push(resource);
       }
+    }
+  }
+
+  _loadMediaResources(media_content_id, maximumFiles, fileNameFormat, captionFormat) {
+
+    try {
+      //currentDate
+      if (this.config.current_date_format && media_content_id.match(/media-source:\/\/media_source\/(.+\/){1,}{currentDate}(\/(.+){1,})?\/[.]/g)) {
+        media_content_id = media_content_id.replace("{currentDate}", this.formatter.currentDate(this.config.current_date_format));
+      }
+
+      //check media_content_id format
+      if (!media_content_id.match(/media-source:\/\/media_source\/(.+\/){1,}[.]/g)) {
+        console.error("media_content_id malformed", media_content_id);
+        return [];
+      }
+
+      this._loadMediaResourcesScan(media_content_id, maximumFiles);
+
+    } catch (error) {
+      console.error(error);
+      return [];
+    }
+  }
+
+  async _loadMediaResourcesScan(media_content_id, maximumFiles) {
+
+    try {
+      if (this.resources.length >= maximumFiles) {
+        return;
+      }
+
+      var wsData = {
+        type: "media_source/browse_media",
+        media_content_id: media_content_id
+      };
+      const response = await this.hass.connection.sendMessagePromise(wsData);
+
+      //sort 
+      response.children.sort(function (a, b) {
+        if (a.title > b.title) {
+          return -1;
+        }
+        if (a.title < b.title) {
+          return 1;
+        }
+        return 0;
+      })
+
+      for (let index = 0; index < response.children.length; index++) {
+        const element = response.children[index];
+        if (index >= maximumFiles) {
+          break;
+        }
+        if (element.media_class !== 'directory') {
+          //one more promise
+          //{"type":"media_source/resolve_media","media_content_id":"media-source://media_source/share/snapshots/filename.jpg","id":24}
+          var wsData = {
+            type: "media_source/resolve_media",
+            media_content_id: element.media_content_id
+          };
+          //{"id": 24, "type": "result", "success": true, "result": {"url": "/media/share/snapshots/filename.jpg?authSig=key", "mime_type": "image/jpeg"}}
+          const response = await this.hass.connection.sendMessagePromise(wsData);
+        
+          var resource = {
+            url: response.url,
+            name: element.title,
+            extension: element.title.split(".")[1],
+            caption: this.formatter.format(element.title, this.config.file_name_format, this.config.caption_format),
+            index: this.resources.length
+          }
+          this.resources.push(resource);
+
+        }
+      }
+    } catch (e) {
+      this.error = e.message;
+      console.log("Error loading media: " + e.message);
     }
   }
 
@@ -472,10 +635,17 @@ class GalleryCard extends LitElement {
 customElements.define("gallery-card", GalleryCard);
 
 class GalleryCardEditor extends LitElement {
+
+  constructor() {
+    super();
+    this.formatter = new GalleryCardDateFormatter();
+  }
+
   static get properties() {
     return {
       _fileNameExample: {},
-      _captionExample: {}
+      _captionExample: {},
+      _currentDateFormatExample: {}
     };
   }
 
@@ -497,7 +667,17 @@ class GalleryCardEditor extends LitElement {
     if (this._config.file_name_format && this._config.file_name_format != ""
       && this._config.caption_format && this._config.caption_format != "") {
       this._captionExample = this.generateSampleText(this._config.caption_format, false);
-    } 
+    }
+
+    this._currentDateFormatExample = this.formatter.currentDate(this._config.current_date_format || 'YYYYMMDD');
+
+    //load media_source root
+    this._mediaSources = (async () => {
+      const response = await this.hass.connection.sendMessagePromise({
+        type: "media_source/browse_media"
+      });
+      return response.children;
+    })();
   }
 
   configChanged(newConfig) {
@@ -531,6 +711,10 @@ class GalleryCardEditor extends LitElement {
 
   get _captionFormat() {
     return this._config.caption_format || "";
+  }
+
+  get _currentDateFormat() {
+    return this._config.current_date_format || "YYYYMMDD";
   }
 
   formatDate2Digits(str, zeroPad) {
@@ -567,6 +751,7 @@ class GalleryCardEditor extends LitElement {
   }
 
   render() {
+
     return html`
     <div class="card-config">
     <div class="side-by-side">
@@ -596,6 +781,9 @@ class GalleryCardEditor extends LitElement {
               ${Object.keys(this.hass.states).filter(entId => entId.startsWith('camera.') || this.hass.states[entId].attributes.fileList != undefined).sort().map(entId => html`
                     <paper-item>${entId}</paper-item>
                 `)}
+              ${Object.keys(this._mediaSources).sort().map(mediaId => html`
+                    <paper-item>${mediaId.title}</paper-item>
+              `)}
             </paper-listbox>
           </paper-dropdown-menu>
         </div>
@@ -673,6 +861,16 @@ class GalleryCardEditor extends LitElement {
           @value-changed="${this._valueChanged}"
         ></paper-input>
         <div class="example">Your captions will look like: ${this._captionExample}</div>
+        <paper-input
+          .label="${"Format for current date folder"}
+          (${this.hass.localize(
+      "ui.panel.lovelace.editor.card.config.optional"
+    )})"
+          .value="${this._currentDateFormat}"
+          .configValue="${"current_date_format"}"
+          @value-changed="${this._valueChanged}"
+        ></paper-input>
+        <div class="example">The "today" folder will look like this : ${this._currentDateFormatExample}</div>
       </div>
     </div>
     `;
